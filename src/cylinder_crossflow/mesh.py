@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from math import pi
 
-from .settings import X_MAX, X_MIN, Y_MAX, Y_MIN
+from cylinder_crossflow.settings import X_MAX, X_MIN, Y_MAX, Y_MIN
 
 import gmsh
 import math
@@ -103,9 +103,9 @@ def draw_farfield_lines(tags: list[int]) -> list[int]:
         ) for i, tag in enumerate(tags)
     ]
 
-def form_sector_surfaces(inner_tags: list[int], outer_tags: list[int]) -> list[int]:
+def form_sector_surfaces(inner_tags: list[int], outer_tags: list[int]) -> tuple[list[int], list[int]]:
     """Return a list of tags uniquely associated with a surface for each sector.
-    
+
     Creates a CAD surface for each of the eight sectors in the domain. Each sector is defined as having an
     inner and outer bounding curve/line. The method first creates additional lines spanning radially outwards
     before creating the surface that connects the associated radial lines and inner/outer lines together. Each
@@ -114,9 +114,15 @@ def form_sector_surfaces(inner_tags: list[int], outer_tags: list[int]) -> list[i
 
     :param inner_tags: The list of tags for the inner curves or lines.
     :param outer_tags: The list of tags for the outer curves or lines.
-    :return: The list of surface tags for each sector in counter-clockwise order.
+    :return: The list of surface tags for each sector and line tags for the radial lines in counter-clockwise order.
     """
     def draw_radial_lines() -> list[int]:
+        """Return a list of tags uniquely associated with the radial lines that connect respective points along
+        the inner and outer curves.
+
+        :raises ValueError: If the number of points differs between the inner and outer curves.
+        :return: The list of tags of the radial lines.
+        """
         if len(inner_tags) != len(outer_tags):
             raise ValueError(
                 f'The number of points in the inner and outer loops do not match, got {len(inner_tags)}'
@@ -137,7 +143,22 @@ def form_sector_surfaces(inner_tags: list[int], outer_tags: list[int]) -> list[i
         loop_tag: int = gmsh.model.geo.add_curve_loop([radial_tag, outer_tag, -radial_lines[(i + 1) % 8], -inner_tag])
         sector_surfaces.append(gmsh.model.geo.add_plane_surface([loop_tag]))
 
-    return sector_surfaces
+    return sector_surfaces, radial_lines
+
+def set_theta_transfinite_curve(
+    n_theta_sectors: int,
+    cylinder_arcs: list[int],
+    ogrid_transition_arcs: list[int],
+    farfield_lines: list[int]
+):
+    for cylinder_arc, ogrid_arc, farfield_line in zip(cylinder_arcs, ogrid_transition_arcs, farfield_lines):
+        gmsh.model.mesh.set_transfinite_curve(cylinder_arc, n_theta_sectors + 1)
+        gmsh.model.mesh.set_transfinite_curve(ogrid_arc, n_theta_sectors + 1)
+        gmsh.model.mesh.set_transfinite_curve(farfield_line, n_theta_sectors + 1)
+
+def set_radial_transfinite_curve(n_radial_layers: int, curves: list[int], progression: float):
+    for curve in curves:
+        gmsh.model.mesh.set_transfinite_curve(curve, n_radial_layers + 1, 'Progression', progression)
 
 def mesh_domain(
     radius: float = 0.5,
@@ -145,6 +166,9 @@ def mesh_domain(
     ogrid_growth: float = 1.1,
     farfield_growth: float = 1.1,
     farfield_boundaries: FarfieldBoundaries = DEFAULT_BOUNDARIES,
+    n_theta_sectors: int = 12,
+    n_radial_ogrid: int = 20,
+    n_radial_farfield: int = 30,
     filename: str | None = None,
     display: bool = True
 ):
@@ -169,11 +193,37 @@ def mesh_domain(
 
     # Form the connections for cylinder radius, O-grid transition radius, and farfield boundaries.
     cylinder_arcs: list[int] = draw_circle_arcs(center_pt, cylinder_pts)
-    ogrid_radius_arcs: list[int] = draw_circle_arcs(center_pt, ogrid_radius_pts)
+    ogrid_transition_arcs: list[int] = draw_circle_arcs(center_pt, ogrid_radius_pts)
     farfield_lines: list[int] = draw_farfield_lines(farfield_pts)
 
-    # Form surfaces within each loop across all of the eight sectors. Each surface's loop is defined as starting from the minor
-    # radial line, traversing counter-clockwise along the outer curve, moving inwards along the major radial line, then traversing
-    # along the inner curve.
-    inner_sector_surfaces: list[int] = form_sector_surfaces(cylinder_arcs, ogrid_radius_arcs)
-    outer_sector_surfaces: list[int] = form_sector_surfaces(ogrid_radius_arcs, farfield_lines)
+    # Form surfaces within each loop across all eight sectors. Each surface's loop starts at the minor radial line and
+    # travels in the counter-clockwise direction.
+    inner_sector_surfaces, inner_radial_lines = form_sector_surfaces(cylinder_arcs, ogrid_transition_arcs)
+    outer_sector_surfaces, outer_radial_lines = form_sector_surfaces(ogrid_transition_arcs, farfield_lines)
+
+    # Synchronize the geometry
+    gmsh.model.geo.synchronize()
+
+    # Divide the radial lines and arcs by the respective number of nodes by setting the number of transfinite curves
+    # in the mesh object.
+    set_theta_transfinite_curve(n_theta_sectors, cylinder_arcs, ogrid_transition_arcs, farfield_lines)
+    set_radial_transfinite_curve(n_radial_ogrid, inner_radial_lines, ogrid_growth)
+    set_radial_transfinite_curve(n_radial_farfield, outer_radial_lines, farfield_growth)
+
+    surfaces: list[int] = inner_sector_surfaces + outer_sector_surfaces
+    for surface in surfaces:
+        gmsh.model.mesh.set_transfinite_surface(surface)
+        gmsh.model.mesh.set_recombine(2, surface)
+
+    gmsh.model.mesh.generate(2)
+
+    if filename:
+        gmsh.write(filename)
+
+    if display:
+        gmsh.fltk.run()
+
+    gmsh.finalize()
+
+if __name__ == '__main__':
+    mesh_domain()

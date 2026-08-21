@@ -1,13 +1,17 @@
 [project]
 name = "2d-compressible-cylinder-crossflow-fvm-solver"
 version = "0.1.0"
-description = "Add your description here"
+description = "Compressible finite volume solver for a cylinder in crossflow"
 readme = "README.md"
+classifiers = ["Private :: "Do Not Upload"]
 authors = [
     { name = "Frank Wei", email = "fwei1729@gmail.com" }
 ]
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "gmsh>=4.15.2",
+    "numpy>=2.4.6",
+]
 
 [project.scripts]
 2d-compressible-cylinder-crossflow-fvm-solver = "2d_compressible_cylinder_crossflow_fvm_solver:main"

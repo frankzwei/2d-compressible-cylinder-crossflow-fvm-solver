@@ -1,229 +1,307 @@
+from argparse import HelpFormatter, Namespace
 from dataclasses import dataclass
-from math import pi
+from math import ceil, pi
 
-from cylinder_crossflow.settings import X_MAX, X_MIN, Y_MAX, Y_MIN
-
-import gmsh
+import argparse
 import math
+from pathlib import Path
+import gmsh
 
 
 @dataclass(frozen=True)
-class FarfieldBoundaries:
+class FluidDomain:
 
     x_min: float
-    y_min: float
     x_max: float
     y_max: float
 
-DEFAULT_BOUNDARIES: FarfieldBoundaries = FarfieldBoundaries(X_MIN, Y_MIN, X_MAX, Y_MAX)
+    @property
+    def y_min(self) -> float:
+        return -self.y_max
 
-def check_inequality(small: float, large: float):
-    if small >= large:
-        raise ValueError(f'Failed the inequality check: minimum value {small} exceeds maximum value {large}')
+@dataclass(frozen=True)
+class PrismLayer:
 
-def check_radius(xc: float, yc: float, farfield_boundaries: FarfieldBoundaries, radius: float):
-    max_radius_tuple: tuple[float, float, float, float] = (
-        farfield_boundaries.x_max - xc,
-        xc - farfield_boundaries.x_min,
-        farfield_boundaries.y_max - yc,
-        yc - farfield_boundaries.y_min
+    first_layer_height: float
+    growth_rate: float
+    num_layers: int
+
+    @property
+    def total_thickness(self) -> float:
+        return self.first_layer_height * (self.growth_rate ** self.num_layers - 1) / (self.growth_rate - 1)
+
+def parse_cli_args(argv: list[str] | None = None) -> Namespace:
+    parser = argparse.ArgumentParser(
+        description='Generate an unstructured quadrangle mesh around a cylinder.',
+        formatter_class=lambda prog: HelpFormatter(prog, width=120)
+    )
+    
+    parser.add_argument(
+        '--radius',
+        dest='radius',
+        type=float,
+        help='the radius of the cylinder in meters (default: %(default)s m)',
+        default=1
+    )
+    
+    parser.add_argument(
+        '--x-max',
+        dest='x_max',
+        type=float,
+        help='the maximum X coordinate of the farfield outlet in meters (default: %(default)s m)',
+        default=30
+    )
+    
+    parser.add_argument(
+        '--x-min',
+        dest='x_min',
+        type=float,
+        help='the minimum X coordinate of the farfield inlet in meters (default: %(default)s m)',
+        default=-10
+    )
+    
+    parser.add_argument(
+        '--y',
+        dest='y',
+        type=float,
+        help='the positive Y coordinate of the farfield domain in meters (default: %(default)s m)',
+        default=10
+    )
+    
+    parser.add_argument(
+        '--local-size',
+        dest='local_size',
+        type=float,
+        help='local mesh refinement size near the cylinder in meters (default: %(default)s m)',
+        default=0.1
+    )
+    
+    parser.add_argument(
+        '--base-size',
+        dest='base_size',
+        type=float,
+        help='base mesh size far from the cylinder in meters (default: %(default)s m)',
+        default=1.5
+    )
+    
+    parser.add_argument(
+        '--prisms-first-cell-height',
+        dest='prisms_first_cell_height',
+        type=float,
+        help='the thickness of the first prism layer in meters (default: %(default)s m)',
+        default=1e-3
+    )
+    
+    parser.add_argument(
+        '--prisms-growth',
+        dest='prisms_growth',
+        type=float,
+        help='the geometric growth rate between prism layers (default: %(default)s)',
+        default=1.2
+    )
+    
+    parser.add_argument(
+        '--num-prisms',
+        dest='num_prisms',
+        type=int,
+        help='number of prism layers near the cylinder (default: %(default)s)',
+        default=30
+    )
+    
+    parser.add_argument(
+        '--filename',
+        dest='filename',
+        type=str,
+        help='the file path to save the mesh to, must have a \'.msh\' extension',
+        default=None
     )
 
-    max_radius: float = min(max_radius_tuple)
-    if radius >= max_radius:
+    parser.add_argument(
+        '--show-gui',
+        dest='show_gui',
+        action='store_true',
+        help='display the generated mesh'
+    )
+
+    return parser.parse_args(argv)
+
+def _check_filename(filename: str | None) -> Path | None:
+    if not filename:
+        return None
+    
+    path: Path = Path(filename).expanduser().resolve()
+    base_name, _, extension = path.name.rpartition('.')
+    return path if base_name and extension == 'msh' else None
+
+def _draw_cylinder_arcs(local_size: float, radius: float) -> tuple[list[int], list[int]]:
+    """Generate the points and arcs that form a circle with the specified radius and cell size.
+
+    Four points are used to create a circle with the given radius centered at the origin. The cell sizes near the
+    circle will have a local refinement of the specified size.
+
+    :param local_size: The target cell size close to the circle.
+    :param radius: The radius of the circle.
+    :return: The list of tags defining the points and circular arcs that connect adjacent points together.
+    """
+    pts: list[int] = []
+    for i in range(4):
+        theta = 0.5 * pi * i
+        x = radius * math.cos(theta)
+        y = radius * math.sin(theta)
+        pts.append(gmsh.model.geo.add_point(x, y, 0, local_size))
+
+    center: int = gmsh.model.geo.add_point(0, 0, 0, local_size)
+    arcs: list[int] = []
+    for i, start in enumerate(pts):
+        end = pts[(i + 1) % len(pts)]
+        arcs.append(gmsh.model.geo.add_circle_arc(start, center, end))
+
+    return pts, arcs
+
+def _draw_farfield_lines(farfield_size: float, domain: FluidDomain) -> tuple[list[int], list[int]]:
+    vertices: list[tuple[float, float]] = [
+        (domain.x_max, domain.y_max),
+        (domain.x_min, domain.y_max),
+        (domain.x_min, domain.y_min),
+        (domain.x_max, domain.y_min)
+    ]
+
+    pts: list[int] = []
+    for x, y in vertices:
+        pts.append(gmsh.model.geo.add_point(x, y, 0, farfield_size))
+
+    lines: list[int] = []
+    for i, start in enumerate(pts):
+        end = pts[(i + 1) % len(pts)]
+        lines.append(gmsh.model.geo.add_line(start, end))
+
+    return pts, lines
+
+def _draw_radial_lines(inner_curve: list[int], outer_curve: list[int]) -> list[int]:
+    if len(inner_curve) != len(outer_curve):
         raise ValueError(
-            f'The radius {radius:.2f} must fit completely inside the farfield boundaries'
+            f'Different number of points between the inner and outer curves: {len(inner_curve)} inner points and '
+            f'{len(outer_curve)} outer points'
         )
 
-def generate_radius_points(xc: float, yc: float, radius: float, ogrid_radius: float) -> tuple[list[int], list[int]]:
-    """Return a list of tags uniquely associated with the points that make up the cylinder and ogrid radius.
+    lines: list[int] = []
+    for start, end in zip(inner_curve, outer_curve):
+        lines.append(gmsh.model.geo.add_line(start, end))
 
-    The points are ordered counter-clockwise, starting at the +X axis. By default, only 8 points are used to
-    generate the O-grid mesh.
+    return lines
 
-    :param xc: The X coordinate of the cylinder's center.
-    :param yc: The Y coordinate of the cylinder's center.
-    :param radius: The cylinder radius.
-    :param ogrid_radius: The radius of the o-grid interface.
-    :return: A tuple of the list of cylinder and O-grid radius points.
+def _form_interface_surface(cylinder_arcs: list[int], interface_arcs: list[int], radial_lines: list[int]) -> list[int]:
+    surfaces: list[int] = []
+    for i, (cylinder_arc, interface_arc, radial_line) in enumerate(zip(cylinder_arcs, interface_arcs, radial_lines)):
+        next_line = radial_lines[(i + 1) % len(radial_lines)]
+        loop = gmsh.model.geo.add_curve_loop([radial_line, interface_arc, -next_line, -cylinder_arc])
+        surface = gmsh.model.geo.add_plane_surface([loop])
+        
+        gmsh.model.geo.mesh.set_transfinite_surface(surface)
+        gmsh.model.geo.mesh.set_recombine(2, surface)
+        surfaces.append(surface)
+
+    return surfaces
+
+def _form_farfield_surface(interface_arcs: list[int], farfield_lines: list[int]) -> int:
+    interface_loop = gmsh.model.geo.add_curve_loop(interface_arcs)
+    farfield_loop = gmsh.model.geo.add_curve_loop(farfield_lines)
+    surface = gmsh.model.geo.add_plane_surface([farfield_loop, interface_loop])
+    
+    gmsh.model.geo.mesh.set_recombine(2, surface)
+    return surface
+
+def _ogrid_interface_radius(radius: float, prisms: PrismLayer) -> float:
+    """Compute the radius of the interface between the cylinder prism layers and farfield cells.
+
+    :param radius: The cylinder's radius in meters.
+    :param prisms: The prism layer settings for the cylinder.
+    :return: The radius of the circular O-grid interface in meters.
     """
-    cylinder_pts: list[int] = []
-    ogrid_radius_pts: list[int] = []
-    for i in range(8):
-        theta = 0.25 * pi * i
-        x: float = xc + radius * math.cos(theta)
-        y: float = yc + radius * math.sin(theta)
+    return prisms.total_thickness + radius
 
-        cylinder_pts.append(gmsh.model.geo.add_point(x, y, 0))
-
-        x: float = xc + ogrid_radius * math.cos(theta)
-        y: float = yc + ogrid_radius * math.sin(theta)
-
-        ogrid_radius_pts.append(gmsh.model.geo.add_point(x, y, 0))
-
-    return cylinder_pts, ogrid_radius_pts
-
-def generate_farfield_pts(xc: float, yc: float, farfield_boundaries: FarfieldBoundaries) -> list[int]:
-    """Return a list of tags uniquely associated with the points that make up the farfield boundaries.
-
-    The points are ordered counter-clockwise, starting at the +X radius.
-
-    :param xc: The X coordinate of the cylinder's center.
-    :param yc: The Y coordinate of the cylinder's center.
-    :param farfield_boundaries: The namespace representation of the farfield coordinates.
-    :return: A list of tags for the farfield coordinates.
-    """
-    coordinates: list[tuple[float, float]] = [
-        (farfield_boundaries.x_max, yc),
-        (farfield_boundaries.x_max, farfield_boundaries.y_max),
-        (xc, farfield_boundaries.y_max),
-        (farfield_boundaries.x_min, farfield_boundaries.y_max),
-        (farfield_boundaries.x_min, yc),
-        (farfield_boundaries.x_min, farfield_boundaries.y_min),
-        (xc, farfield_boundaries.y_min),
-        (farfield_boundaries.x_max, farfield_boundaries.y_min)
-    ]
-
-    return [gmsh.model.geo.add_point(x, y, 0) for x, y in coordinates]
-
-def draw_circle_arcs(center_tag: int, tags: list[int]) -> list[int]:
-    return [
-        gmsh.model.geo.add_circle_arc(
-            tag,
-            center_tag,
-            tags[(i + 1) % 8]
-        ) for i, tag in enumerate(tags)
-    ]
-
-def draw_farfield_lines(tags: list[int]) -> list[int]:
-    return [
-        gmsh.model.geo.add_line(
-            tag,
-            tags[(i + 1) % 8]
-        ) for i, tag in enumerate(tags)
-    ]
-
-def form_sector_surfaces(inner_tags: list[int], outer_tags: list[int]) -> tuple[list[int], list[int]]:
-    """Return a list of tags uniquely associated with a surface for each sector.
-
-    Creates a CAD surface for each of the eight sectors in the domain. Each sector is defined as having an
-    inner and outer bounding curve/line. The method first creates additional lines spanning radially outwards
-    before creating the surface that connects the associated radial lines and inner/outer lines together. Each
-    surface is oriented counter-clockwise and the method returns the sectors ordered in the counter-clockwise
-    direction.
-
-    :param inner_tags: The list of tags for the inner curves or lines.
-    :param outer_tags: The list of tags for the outer curves or lines.
-    :return: The list of surface tags for each sector and line tags for the radial lines in counter-clockwise order.
-    """
-    def draw_radial_lines() -> list[int]:
-        """Return a list of tags uniquely associated with the radial lines that connect respective points along
-        the inner and outer curves.
-
-        :raises ValueError: If the number of points differs between the inner and outer curves.
-        :return: The list of tags of the radial lines.
-        """
-        if len(inner_tags) != len(outer_tags):
-            raise ValueError(
-                f'The number of points in the inner and outer loops do not match, got {len(inner_tags)}'
-                f'inner points and {len(outer_tags)} outer points'
-            )
-
-        return [
-            gmsh.model.geo.add_line(
-                inner_tag,
-                outer_tag
-            ) for inner_tag, outer_tag in zip(inner_tags, outer_tags)
-        ]
-
-    radial_lines: list[int] = draw_radial_lines()
-
-    sector_surfaces: list[int] = []
-    for i, (inner_tag, outer_tag, radial_tag) in enumerate(zip(inner_tags, outer_tags, radial_lines)):
-        loop_tag: int = gmsh.model.geo.add_curve_loop([radial_tag, outer_tag, -radial_lines[(i + 1) % 8], -inner_tag])
-        sector_surfaces.append(gmsh.model.geo.add_plane_surface([loop_tag]))
-
-    return sector_surfaces, radial_lines
-
-def set_theta_transfinite_curve(
-    n_theta_sectors: int,
+def _subdivide_interface_region(
+    radius: float,
+    local_size: float,
     cylinder_arcs: list[int],
-    ogrid_transition_arcs: list[int],
-    farfield_lines: list[int]
+    interface_arcs: list[int],
+    radial_lines: list[int],
+    cylinder_prisms: PrismLayer
 ):
-    for cylinder_arc, ogrid_arc, farfield_line in zip(cylinder_arcs, ogrid_transition_arcs, farfield_lines):
-        gmsh.model.mesh.set_transfinite_curve(cylinder_arc, n_theta_sectors + 1)
-        gmsh.model.mesh.set_transfinite_curve(ogrid_arc, n_theta_sectors + 1)
-        gmsh.model.mesh.set_transfinite_curve(farfield_line, n_theta_sectors + 1)
+    num_pts: int = ceil(0.5 * pi * radius / local_size)
+    for cylinder_arc, interface_arc, radial_line in zip(cylinder_arcs, interface_arcs, radial_lines):
+        gmsh.model.geo.mesh.set_transfinite_curve(cylinder_arc, num_pts + 1)
+        gmsh.model.geo.mesh.set_transfinite_curve(interface_arc, num_pts + 1)
+        gmsh.model.geo.mesh.set_transfinite_curve(
+            radial_line,
+            cylinder_prisms.num_layers + 1,
+            'Progression',
+            cylinder_prisms.growth_rate
+        )
 
-def set_radial_transfinite_curve(n_radial_layers: int, curves: list[int], progression: float):
-    for curve in curves:
-        gmsh.model.mesh.set_transfinite_curve(curve, n_radial_layers + 1, 'Progression', progression)
+def _ignore_constructions(*args: tuple[int, list[int]]):
+    construction: list[tuple[int, int]] = []
+    for dim, tags in args:
+        for tag in tags:
+            construction.append((dim, tag))
+    
+    gmsh.model.set_visibility(construction, False)
 
 def mesh_domain(
-    radius: float = 0.5,
-    ogrid_radius: float = 5,
-    ogrid_growth: float = 1.1,
-    farfield_growth: float = 1.1,
-    farfield_boundaries: FarfieldBoundaries = DEFAULT_BOUNDARIES,
-    n_theta_sectors: int = 12,
-    n_radial_ogrid: int = 20,
-    n_radial_farfield: int = 30,
+    radius: float = 1,
+    local_size: float = 0.1,
+    base_size: float = 1.5,
+    cylinder_prisms: PrismLayer = PrismLayer(0.001, 1.2, 30),
+    domain: FluidDomain = FluidDomain(-10, 30, 10),
     filename: str | None = None,
-    display: bool = True
+    display: bool = False
 ):
     gmsh.initialize()
+    gmsh.clear()
     gmsh.model.add('2d_cylinder_compressible_crossflow')
 
-    # Define center coordinates of circle
-    xc: float = 0
-    yc: float = 0
+    interface_radius: float = _ogrid_interface_radius(radius, cylinder_prisms)
+    cylinder_pts, cylinder_arcs = _draw_cylinder_arcs(local_size, radius)
+    interface_pts, interface_arcs = _draw_cylinder_arcs(base_size, interface_radius)
+    farfield_pts, farfield_lines = _draw_farfield_lines(base_size, domain)
+    radial_lines: list[int] = _draw_radial_lines(cylinder_pts, interface_pts)
 
-    # Check the cylinder and O-grid radius are within the farfield boundaries. This does not check for
-    # whether the cylinder and O-grid radius comfortably fit inside the domain boundaries.
-    check_radius(xc, yc, farfield_boundaries, radius)
-    check_radius(xc, yc, farfield_boundaries, ogrid_radius)
+    # Divide the cylinder arcs, interface arcs, and radial lines to form the interface region mesh. This method creates
+    # a uniform structured mesh around the cylinder that serve as prism layers.
+    _subdivide_interface_region(radius, local_size, cylinder_arcs, interface_arcs, radial_lines, cylinder_prisms)
 
-    # Verify the O-grid radius is larger than the cylinder radius
-    check_inequality(radius, ogrid_radius)
-
-    center_pt = gmsh.model.geo.add_point(xc, yc, 0)
-    cylinder_pts, ogrid_radius_pts = generate_radius_points(xc, yc, radius, ogrid_radius)
-    farfield_pts = generate_farfield_pts(xc, yc, farfield_boundaries)
-
-    # Form the connections for cylinder radius, O-grid transition radius, and farfield boundaries.
-    cylinder_arcs: list[int] = draw_circle_arcs(center_pt, cylinder_pts)
-    ogrid_transition_arcs: list[int] = draw_circle_arcs(center_pt, ogrid_radius_pts)
-    farfield_lines: list[int] = draw_farfield_lines(farfield_pts)
-
-    # Form surfaces within each loop across all eight sectors. Each surface's loop starts at the minor radial line and
-    # travels in the counter-clockwise direction.
-    inner_sector_surfaces, inner_radial_lines = form_sector_surfaces(cylinder_arcs, ogrid_transition_arcs)
-    outer_sector_surfaces, outer_radial_lines = form_sector_surfaces(ogrid_transition_arcs, farfield_lines)
-
-    # Synchronize the geometry
+    interface_surfaces: list[int] = _form_interface_surface(cylinder_arcs, interface_arcs, radial_lines)
+    farfield_surface: int = _form_farfield_surface(interface_arcs, farfield_lines)
+    surfaces: list[int] = interface_surfaces + [farfield_surface]
     gmsh.model.geo.synchronize()
-
-    # Divide the radial lines and arcs by the respective number of nodes by setting the number of transfinite curves
-    # in the mesh object.
-    set_theta_transfinite_curve(n_theta_sectors, cylinder_arcs, ogrid_transition_arcs, farfield_lines)
-    set_radial_transfinite_curve(n_radial_ogrid, inner_radial_lines, ogrid_growth)
-    set_radial_transfinite_curve(n_radial_farfield, outer_radial_lines, farfield_growth)
-
-    surfaces: list[int] = inner_sector_surfaces + outer_sector_surfaces
-    for surface in surfaces:
-        gmsh.model.mesh.set_transfinite_surface(surface)
-        gmsh.model.mesh.set_recombine(2, surface)
-
+    
+    gmsh.model.add_physical_group(2, interface_surfaces + [farfield_surface], name='Fluid')
+    gmsh.model.add_physical_group(1, cylinder_arcs, name='Cylinder')
+    gmsh.model.add_physical_group(1, farfield_lines, name='Farfield')
+    
+    # Color mesh elements according to their physical groups
+    gmsh.option.set_number('Mesh.ColorCarousel', 2)
+    gmsh.option.set_number('Mesh.Algorithm', 8)
+    
+    # Generate the 2D mesh    
     gmsh.model.mesh.generate(2)
-
-    if filename:
-        gmsh.write(filename)
-
+    
+    _ignore_constructions((1, interface_arcs), (1, radial_lines), (0, interface_pts))
+    if (filename_path := _check_filename(filename)) is not None:
+        filename_path.unlink(missing_ok=True)
+        filename_path.parent.mkdir(parents=True, exist_ok=True)
+        gmsh.write(str(filename_path))
+    
     if display:
         gmsh.fltk.run()
-
+    
     gmsh.finalize()
 
+def main(argv: list[str] | None = None):
+    args: Namespace = parse_cli_args(argv)
+    domain: FluidDomain = FluidDomain(args.x_min, args.x_max, args.y)
+    prisms: PrismLayer = PrismLayer(args.prisms_first_cell_height, args.prisms_growth, args.num_prisms)
+    mesh_domain(args.radius, args.local_size, args.base_size, prisms, domain, args.filename, args.show_gui)
+
 if __name__ == '__main__':
-    mesh_domain()
+    main()

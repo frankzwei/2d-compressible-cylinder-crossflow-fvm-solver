@@ -1,6 +1,7 @@
 from argparse import HelpFormatter, Namespace
 from dataclasses import InitVar, dataclass, field
 from math import pi
+from pathlib import Path
 from numpy.typing import NDArray
 
 import argparse
@@ -138,13 +139,200 @@ class GeometryBuilder:
 
 def parse_cli_args(argv: list[str] | None = None) -> Namespace:
     parser = argparse.ArgumentParser(
-        description='',
+        description='Generate a structured mesh for a cylinder in crossflow.',
         formatter_class=lambda prog: HelpFormatter(prog, width=120)
     )
 
-    parser.add_argument('--show-gui', dest='show_gui', action='store_true')
+    parser.add_argument(
+        '--x-min',
+        dest='x_min',
+        type=float,
+        help='set the minimum X coordinate for the fluid domain in meters (default: %(default)s m)',
+        default=-20
+    )
 
+    parser.add_argument(
+        '--x-max',
+        dest='x_max',
+        type=float,
+        help='set the maximum X coordinate for the fluid domain in meters (default: %(default)s m)',
+        default=50
+    )
+
+    parser.add_argument(
+        '--y',
+        dest='y_max',
+        type=float,
+        help='set the maximum Y coordinate for the fluid domain in meters (default: %(default)s m)',
+        default=15
+    )
+
+    parser.add_argument(
+        '--radius',
+        dest='radius',
+        type=float,
+        help='set the radius of the solid cylinder in meters (default: %(default)s m)',
+        default=1
+    )
+
+    parser.add_argument(
+        '--transition-size-ratio',
+        dest='transition_size_ratio',
+        type=float,
+        help='set the ratio between the transition square half width and radius (default: %(default)s)',
+        default=4
+    )
+
+    parser.add_argument(
+        '--smoothing-size-ratio',
+        dest='smoothing_size_ratio',
+        type=float,
+        help='set the ratio between the smoothing square half width and radius (default: %(default)s)',
+        default=6.5
+    )
+
+    parser.add_argument(
+        '--n-theta-cells',
+        dest='num_theta_cells',
+        type=int,
+        help='set the number of cells across the cylinder circumference (default: %(default)s)',
+        default=120
+    )
+
+    parser.add_argument(
+        '--n-prism-cells',
+        dest='num_prism_cells',
+        type=int,
+        help='set the number of prism layer cells (default: %(default)s)',
+        default=26
+    )
+
+    parser.add_argument(
+        '--n-transition-cells',
+        dest='num_transition_cells',
+        type=int,
+        help='set the number of cells in the transition square (default: %(default)s)',
+        default=12
+    )
+
+    parser.add_argument(
+        '--n-left-cells',
+        dest='num_left_cells',
+        type=int,
+        help='set the number of vertical cells left of the cylinder (default: %(default)s)',
+        default=24
+    )
+
+    parser.add_argument(
+        '--n-right-cells',
+        dest='num_right_cells',
+        type=int,
+        help='set the number of vertical cells right of the cylinder (default: %(default)s)',
+        default=96
+    )
+
+    parser.add_argument(
+        '--n-top-cells',
+        dest='num_top_cells',
+        type=int,
+        help='set the number of horizontal cells above the cylinder (default: %(default)s)',
+        default=24
+    )
+
+    parser.add_argument(
+        '--n-bottom-cells',
+        dest='num_bottom_cells',
+        type=int,
+        help='set the number of horizontal cells below the cylinder (default: %(default)s)',
+        default=24
+    )
+
+    parser.add_argument(
+        '--first-cell-height',
+        dest='prism_first_cell_height',
+        type=float,
+        help='set the first cell height in the prism layer in meters (default: %(default)s m)',
+        default=1e-3
+    )
+
+    parser.add_argument(
+        '--prism-growth',
+        dest='prism_growth',
+        type=float,
+        help='set the progression of the prism layers (default: %(default)s)',
+        default=1.2
+    )
+
+    parser.add_argument(
+        '--transition-growth',
+        dest='transition_growth',
+        type=float,
+        help='set the progression in the transition square (default: %(default)s)',
+        default=1
+    )
+
+    parser.add_argument(
+        '--left-growth',
+        dest='left_growth',
+        type=float,
+        help='set the progression of the vertical cells left of the cylinder (default: %(default)s)',
+        default=1.115
+    )
+
+    parser.add_argument(
+        '--right-growth',
+        dest='right_growth',
+        type=float,
+        help='set the progression of the vertical cells right of the cylinder (default: %(default)s)',
+        default=1.016
+    )
+
+    parser.add_argument(
+        '--vertical-growth',
+        dest='vertical_growth',
+        type=float,
+        help='set the progression of the horizontal cells above and below the cylinder (default: %(default)s)',
+        default=1.067
+    )
+
+    parser.add_argument(
+        '--max-smoothing-iterations',
+        dest='max_smoothing_iterations',
+        type=int,
+        help='set the maximum number of iterations to smooth the mesh (default: %(default)s)',
+        default=200
+    )
+
+    parser.add_argument(
+        '--smoothing-relaxation',
+        dest='smoothing_relaxation',
+        type=float,
+        help='set the relaxation smoothing parameter (default: %(default)s)',
+        default=0.5
+    )
+
+    parser.add_argument(
+        '--filename',
+        dest='filename',
+        type=Path,
+        help='set the filename to save the mesh to',
+        default=None
+    )
+
+    parser.add_argument('--show', dest='show', action='store_true', help='display the generated mesh')
     return parser.parse_args(argv)
+
+def _validate_filename(filename: str | Path | None) -> Path | None:
+    if not filename:
+        return None
+
+    path: Path = Path(filename).expanduser().resolve()
+    base, _, extension = path.name.rpartition('.')
+    if not base or extension != 'msh':
+        return None
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 def _draw_circular_arcs(
     geometry: GeometryBuilder,
@@ -342,7 +530,7 @@ def _smooth_interfaces(params: MeshParameters) -> int:
 
     return iteration
 
-def mesh_domain(params: MeshParameters, display: bool = False):
+def mesh_domain(params: MeshParameters, filename: str | Path | None, display: bool = False):
     gmsh.initialize()
     gmsh.clear()
     gmsh.model.add('structured_ogrid_mesh')
@@ -459,17 +647,43 @@ def mesh_domain(params: MeshParameters, display: bool = False):
     geometry.apply_visibilities()
 
     iterations: int = _smooth_interfaces(params)
-    print(f'\nRan {iterations} smoothing iterations\n')
+    print(f'Ran {iterations} smoothing iterations')
 
     if display:
         gmsh.fltk.run()
+
+    if (path := _validate_filename(filename)) is not None:
+        gmsh.write(str(path))
 
     gmsh.finalize()
 
 def main(argv: list[str] | None = None):
     args: Namespace = parse_cli_args(argv)
-    params: MeshParameters = MeshParameters()
-    mesh_domain(params, args.show_gui)
+    params: MeshParameters = MeshParameters(
+        args.x_min,
+        args.x_max,
+        args.y_max,
+        args.radius,
+        args.num_theta_cells,
+        args.num_prism_cells,
+        args.num_transition_cells,
+        args.num_left_cells,
+        args.num_right_cells,
+        args.num_top_cells,
+        args.num_bottom_cells,
+        args.prism_first_cell_height,
+        args.prism_growth,
+        args.transition_growth,
+        args.left_growth,
+        args.right_growth,
+        args.vertical_growth,
+        args.transition_size_ratio,
+        args.smoothing_size_ratio,
+        args.max_smoothing_iterations,
+        args.smoothing_relaxation
+    )
+
+    mesh_domain(params, args.filename, args.show)
 
 if __name__ == '__main__':
     main()

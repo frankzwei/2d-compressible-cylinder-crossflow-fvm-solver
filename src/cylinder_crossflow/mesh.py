@@ -642,6 +642,10 @@ def mesh_domain(params: MeshParameters, filename: str | Path | None, display: bo
     geometry.apply_constraints()
     gmsh.option.set_number('Mesh.ColorCarousel', 2)
     gmsh.option.set_number('Mesh.Algorithm', 8)
+    gmsh.option.set_number('General.BackgroundGradient', 0)
+    gmsh.option.set_color('General.Background', 255, 255, 255)
+    gmsh.option.set_color('General.Foreground', 255, 255, 255)
+    gmsh.option.set_color('Mesh.Lines', 0, 0, 0)
     gmsh.model.mesh.generate(2)
 
     geometry.apply_visibilities()
@@ -649,11 +653,11 @@ def mesh_domain(params: MeshParameters, filename: str | Path | None, display: bo
     iterations: int = _smooth_interfaces(params)
     print(f'Ran {iterations} smoothing iterations')
 
+    if (path := _validate_filename(filename)):
+        gmsh.write(str(path))
+
     if display:
         gmsh.fltk.run()
-
-    if (path := _validate_filename(filename)) is not None:
-        gmsh.write(str(path))
 
     gmsh.finalize()
 

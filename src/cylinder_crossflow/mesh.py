@@ -16,12 +16,12 @@ class MeshParameters:
     x_max: float = 50
     y_max: float = 15
 
-    cylinder_radius: float = 0.8
+    cylinder_radius: float = 1
     transition_half_width: float = field(init=False)
     smoothing_half_width: float = field(init=False)
 
     num_theta_cells: int = 120
-    num_prism_cells: int = 24
+    num_prism_cells: int = 26
     num_transition_cells: int = 12
     num_left_cells: int = 24
     num_right_cells: int = 96
@@ -38,7 +38,7 @@ class MeshParameters:
     transition_square_cylinder_ratio: InitVar[float] = 4
     smoothing_square_cylinder_ratio: InitVar[float] = 6.5
     max_smoothing_iterations: int = 200
-    smoothing_relaxation: float = 0.62
+    smoothing_relaxation: float = 0.5
 
     def __post_init__(self, transition_square_cylinder_ratio: float, smoothing_square_cylinder_ratio: float):
         self.transition_half_width = transition_square_cylinder_ratio * self.cylinder_radius
@@ -64,6 +64,7 @@ class GeometryBuilder:
     _arcs: dict[tuple[int, int, int], tuple[int, int, int]] = field(default_factory=dict, init=False)
     _curve_constraints: dict[int, tuple[int, float]] = field(default_factory=dict, init=False)
     _surface_constraints: dict[int, list[int]] = field(default_factory=dict, init=False)
+    _constructions: set[tuple[int, int]] = field(default_factory=set, init=False)
 
     @staticmethod
     def _coordinate_key(x: float, y: float) -> tuple[float, float]:
@@ -121,6 +122,9 @@ class GeometryBuilder:
                 f'Attempted to change an existing surface constraint\'s corner tags for element {tag}'
             )
 
+    def hide_constructions(self, dim: int, *tags: int):
+        self._constructions.update({(dim, abs(tag)) for tag in tags})
+
     def apply_constraints(self):
         for tag, (num_cells, progression) in self._curve_constraints.items():
             gmsh.model.mesh.set_transfinite_curve(tag, num_cells + 1, 'Progression', progression)
@@ -128,6 +132,9 @@ class GeometryBuilder:
         for tag, corner_tags in self._surface_constraints.items():
             gmsh.model.mesh.set_transfinite_surface(tag, cornerTags=corner_tags)
             gmsh.model.mesh.set_recombine(2, tag)
+
+    def apply_visibilities(self):
+        gmsh.model.set_visibility(list(self._constructions), False)
 
 def parse_cli_args(argv: list[str] | None = None) -> Namespace:
     parser = argparse.ArgumentParser(
@@ -143,14 +150,17 @@ def _draw_circular_arcs(
     geometry: GeometryBuilder,
     radius: float,
     center: int,
-    num_cells: int
+    num_cells: int,
+    hide: bool = False
 ) -> tuple[list[int], list[int]]:
     pts: list[int] = []
     for i in range(4):
         theta: float = 0.25 * pi + 0.5 * pi * i
         x: float = radius * math.cos(theta)
         y: float = radius * math.sin(theta)
-        pts.append(geometry.point(x, y))
+        tag: int = geometry.point(x, y)
+        pts.append(tag)
+        geometry.hide_constructions(0, tag)
 
     arcs: list[int] = []
     for i, start in enumerate(pts):
@@ -158,6 +168,8 @@ def _draw_circular_arcs(
         tag: int = geometry.arc(start, end, center)
         arcs.append(tag)
         geometry.set_transfinite_curve(tag, num_cells)
+        if hide:
+            geometry.hide_constructions(1, tag)
 
     return pts, arcs
 
@@ -165,7 +177,8 @@ def _draw_rectangular_lines(
     geometry: GeometryBuilder,
     vertices: list[tuple[float, float]],
     num_cells: int,
-    progression: float = 1
+    progression: float = 1,
+    hide: bool = False
 ) -> tuple[list[int], list[int]]:
     pts: list[int] = [geometry.point(x, y) for x, y in vertices]
     lines: list[int] = []
@@ -174,7 +187,10 @@ def _draw_rectangular_lines(
         tag: int = geometry.line(start, end)
         lines.append(tag)
         geometry.set_transfinite_curve(tag, num_cells, progression)
+        if hide:
+            geometry.hide_constructions(1, tag)
 
+    geometry.hide_constructions(0, *pts)
     return pts, lines
 
 def _draw_lines(
@@ -182,7 +198,8 @@ def _draw_lines(
     start_pts: list[int],
     end_pts: list[int],
     num_cells: int,
-    progression: float = 1
+    progression: float = 1,
+    hide: bool = False
 ) -> list[int]:
     if len(start_pts) != len(end_pts):
         raise ValueError(
@@ -195,6 +212,8 @@ def _draw_lines(
         tag: int = geometry.line(start, end)
         lines.append(tag)
         geometry.set_transfinite_curve(tag, num_cells, progression)
+        if hide:
+            geometry.hide_constructions(1, tag)
 
     return lines
 
@@ -299,7 +318,7 @@ def _smooth_interfaces(params: MeshParameters) -> int:
     )
     smoothing_weights[boundaries_mask] = 0
 
-    for iteration in range(params.max_smoothing_iterations):
+    for iteration in range(1, params.max_smoothing_iterations + 1):
         neighbor_sums: NDArray[np.float64] = np.zeros_like(xy_coords_copy, dtype=np.float64)
         np.add.at(neighbor_sums, sources, xy_coords_copy[destinations])
 
@@ -315,7 +334,6 @@ def _smooth_interfaces(params: MeshParameters) -> int:
         xy_coords_copy += displacements
 
         if np.max(np.linalg.norm(displacements, axis=1)) <= 1e-10:
-            iteration += 1
             break
 
     for i, tag in enumerate(node_tags):
@@ -324,21 +342,17 @@ def _smooth_interfaces(params: MeshParameters) -> int:
 
     return iteration
 
-def _ignore_construction(*args: tuple[int, list[int]]):
-    dim_tags: list[tuple[int, int]] = [(dim, tag) for dim, tags in args for tag in tags]
-    gmsh.model.set_visibility(dim_tags, False)
-
 def mesh_domain(params: MeshParameters, display: bool = False):
     gmsh.initialize()
     gmsh.clear()
     gmsh.model.add('structured_ogrid_mesh')
 
     geometry: GeometryBuilder = GeometryBuilder()
-    origin: int = geometry.point(0, 0)
+    geometry.hide_constructions(0, origin := geometry.point(0, 0))
     sector_theta_cells: int = round(params.num_theta_cells / 4)
 
     cylinder_pts, cylinder_arcs = _draw_circular_arcs(geometry, params.cylinder_radius, origin, sector_theta_cells)
-    ogrid_pts, ogrid_arcs = _draw_circular_arcs(geometry, params.ogrid_radius, origin, sector_theta_cells)
+    ogrid_pts, ogrid_arcs = _draw_circular_arcs(geometry, params.ogrid_radius, origin, sector_theta_cells, True)
 
     transition_vertices: list[tuple[float, float]] = [
         (params.transition_half_width, params.transition_half_width),
@@ -347,15 +361,15 @@ def mesh_domain(params: MeshParameters, display: bool = False):
         (params.transition_half_width, -params.transition_half_width)
     ]
 
-    transition_pts, transition_lines = _draw_rectangular_lines(geometry, transition_vertices, sector_theta_cells)
+    transition_pts, transition_lines = _draw_rectangular_lines(geometry, transition_vertices, sector_theta_cells, True)
 
     # Draw radial lines spanning between cylinder and O-grid circle, and O-grid circle and transition square
     ogrid_radials: list[int] = _draw_lines(
-        geometry, cylinder_pts, ogrid_pts, params.num_prism_cells, params.prism_growth
+        geometry, cylinder_pts, ogrid_pts, params.num_prism_cells, params.prism_growth, True
     )
 
     transition_radials: list[int] = _draw_lines(
-        geometry, ogrid_pts, transition_pts, params.num_transition_cells, params.transition_growth
+        geometry, ogrid_pts, transition_pts, params.num_transition_cells, params.transition_growth, True
     )
 
     # Create the prism layer and transition region surface mesh
@@ -368,6 +382,9 @@ def mesh_domain(params: MeshParameters, display: bool = False):
     x_coords: list[float] = [params.x_min, -params.transition_half_width, params.transition_half_width, params.x_max]
     y_coords: list[float] = [params.y_min, -params.transition_half_width, params.transition_half_width, params.y_max]
     grid_pts: list[list[int]] = [[geometry.point(x, y) for y in y_coords] for x in x_coords]
+    farfield_vertices: list[tuple[int, int]] = [(0, 0), (0, 3), (3, 0), (3, 3)]
+    intermediate_pts: list[int] = [abs(tag) for i, column in enumerate(grid_pts) for j, tag in enumerate(column) if (i, j) not in farfield_vertices]
+    geometry.hide_constructions(0, *intermediate_pts)
 
     # Set the number of cells in the X and Y directions. Each tuple is defined as the number of cells to "squeeze" or
     # "stack" in the direction. For example, in the X direction, squeeze N cells horizontally.
@@ -388,6 +405,8 @@ def mesh_domain(params: MeshParameters, display: bool = False):
             tag: int = geometry.line(grid_pts[i][j], grid_pts[i + 1][j])
             horizontal_lines[key] = tag
             geometry.set_transfinite_curve(tag, x_num_cells[i], x_growths[i])
+            if j > 0 and j < 3:
+                geometry.hide_constructions(1, tag)
 
         return horizontal_lines[key]
 
@@ -397,6 +416,8 @@ def mesh_domain(params: MeshParameters, display: bool = False):
             tag: int = geometry.line(grid_pts[i][j], grid_pts[i][j + 1])
             vertical_lines[key] = tag
             geometry.set_transfinite_curve(tag, y_num_cells[j], y_growths[j])
+            if i > 0 and i < 3:
+                geometry.hide_constructions(1, tag)
 
         return vertical_lines[key]
 
@@ -431,39 +452,12 @@ def mesh_domain(params: MeshParameters, display: bool = False):
         gmsh.model.mesh.set_smoothing(2, surface, 20)
 
     geometry.apply_constraints()
-
     gmsh.option.set_number('Mesh.ColorCarousel', 2)
     gmsh.option.set_number('Mesh.Algorithm', 8)
     gmsh.model.mesh.generate(2)
 
-    quadrant_line_constructions: list[int] = []
-    for (i, _), line in vertical_lines.items():
-        if i > 0 and i < 3:
-            quadrant_line_constructions.append(line)
+    geometry.apply_visibilities()
 
-    for (_, j), line in horizontal_lines.items():
-        if j > 0 and j < 3:
-            quadrant_line_constructions.append(line)
-
-    quadrant_pt_constructions: list[int] = []
-    for i, y_pts in enumerate(grid_pts):
-        for j, pt in enumerate(y_pts):
-            if (i, j) == (0, 0) or (i, j) == (3, 3) or (i, j) == (0, 3) or (i, j) == (3, 0):
-                continue
-
-            quadrant_pt_constructions.append(pt)
-
-    _ignore_construction(
-        (1, ogrid_arcs),
-        (1, transition_lines),
-        (1, ogrid_radials),
-        (1, transition_radials),
-        (1, quadrant_line_constructions),
-        (0, ogrid_pts),
-        (0, transition_pts),
-        (0, quadrant_pt_constructions),
-        (0, cylinder_pts)
-    )
     iterations: int = _smooth_interfaces(params)
     print(f'\nRan {iterations} smoothing iterations\n')
 

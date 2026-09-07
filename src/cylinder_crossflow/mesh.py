@@ -691,7 +691,7 @@ def mesh_domain(params: MeshParameters, filename: str | Path | None, display: bo
     # Run smoothing operations using Laplacian smoothing to alleviate the sharp corner transitions between the O-grid
     # cells and transition square cells
     iterations: int = _smooth_interface_nodes(params)
-    print(f'Ran {iterations} smoothing iterations')
+    print(f'\nRan {iterations} smoothing iterations\n')
 
     # Verify the file path is valid and save all physical groups to the mesh file
     if (path := _validate_filename(filename)):

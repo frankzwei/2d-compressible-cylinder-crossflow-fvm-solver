@@ -8,7 +8,3 @@ wheels/
 
 # Virtual environments
 .venv
-
-# Root Python files
-*.py
-*.msh

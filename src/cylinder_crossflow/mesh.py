@@ -139,7 +139,7 @@ class GeometryBuilder:
 
 def parse_cli_args(argv: list[str] | None = None) -> Namespace:
     parser = argparse.ArgumentParser(
-        description='Generate a structured mesh for a cylinder in crossflow.',
+        description='generate a structured mesh for a cylinder in crossflow.',
         formatter_class=lambda prog: HelpFormatter(prog, width=120)
     )
 
@@ -423,12 +423,15 @@ def _form_sector_surface(
 
     return surfaces
 
-def _smooth_interfaces(params: MeshParameters) -> int:
+def _check_inverted_cells():
+    pass
+
+def _smooth_interface_nodes(params: MeshParameters) -> int:
     if params.max_smoothing_iterations == 0:
         return 0
 
     node_tags, xyz_coords, _ = gmsh.model.mesh.get_nodes()
-    xy_coords: NDArray[np.float64] = np.reshape(xyz_coords, (-1, 3))[:, :-1].copy()
+    original_xy: NDArray[np.float64] = np.reshape(xyz_coords, (-1, 3))[:, :-1].copy()
     tag_to_index: dict[int, int] = {int(tag): i for i, tag in enumerate(node_tags)}
 
     quad_indices: list[NDArray[np.int64]] = []
@@ -481,8 +484,7 @@ def _smooth_interfaces(params: MeshParameters) -> int:
     neighbor_counts: NDArray[np.int64] = np.bincount(sources, minlength=len(node_tags)).astype(np.int64)
 
     # Compute distance of all nodes from the origin, used to classify static nodes inside prism layers
-    original_xy: NDArray[np.float64] = xy_coords.copy()
-    xy_coords_copy: NDArray[np.float64] = original_xy.copy()
+    xy: NDArray[np.float64] = original_xy.copy()
     radius: NDArray[np.float64] = np.linalg.norm(original_xy, axis=1)
     max_coordinate: NDArray[np.float64] = np.max(np.abs(original_xy), axis=1)
 
@@ -499,33 +501,48 @@ def _smooth_interfaces(params: MeshParameters) -> int:
     smoothing_weights[neighbor_counts == 0] = 0
 
     boundaries_mask: NDArray[np.bool] = (
-        np.isclose(xy_coords[:, 0], params.x_min) |
-        np.isclose(xy_coords[:, 0], params.x_max) |
-        np.isclose(xy_coords[:, 1], params.y_min) |
-        np.isclose(xy_coords[:, 1], params.y_max)
+        np.isclose(original_xy[:, 0], params.x_min) |
+        np.isclose(original_xy[:, 0], params.x_max) |
+        np.isclose(original_xy[:, 1], params.y_min) |
+        np.isclose(original_xy[:, 1], params.y_max)
     )
     smoothing_weights[boundaries_mask] = 0
 
     for iteration in range(1, params.max_smoothing_iterations + 1):
-        neighbor_sums: NDArray[np.float64] = np.zeros_like(xy_coords_copy, dtype=np.float64)
-        np.add.at(neighbor_sums, sources, xy_coords_copy[destinations])
+        neighbor_sums: NDArray[np.float64] = np.zeros_like(xy, dtype=np.float64)
+        np.add.at(neighbor_sums, sources, xy[destinations])
 
         connected: NDArray[np.bool] = neighbor_counts > 0
-        neighbor_average: NDArray[np.float64] = xy_coords_copy.copy()
+        neighbor_average: NDArray[np.float64] = xy.copy()
         neighbor_average[connected] = neighbor_sums[connected] / neighbor_counts[connected, None]
 
         smoothing_targets: NDArray[np.float64] = (
             smoothing_weights[:, None] * neighbor_average + (1 - smoothing_weights[:, None]) * original_xy
         )
 
-        displacements: NDArray[np.float64] = params.smoothing_relaxation * (smoothing_targets - xy_coords_copy)
-        xy_coords_copy += displacements
+        displacements: NDArray[np.float64] = params.smoothing_relaxation * (smoothing_targets - xy)
+        xy += displacements
 
         if np.max(np.linalg.norm(displacements, axis=1)) <= 1e-10:
             break
 
+    # Check whether any cells were inverted while smoothing. Throw an error if an inverted cell is detected
+    quad_xy: NDArray[np.float64] = xy[quads]
+    signed_area: NDArray[np.float64] = 0.5 * np.sum(
+        quad_xy[:, :, 0] * np.roll(quad_xy[:, :, 1], -1, axis=1) -
+        quad_xy[:, :, 1] * np.roll(quad_xy[:, :, 0], -1, axis=1)
+        , axis=1
+    )
+    orientation: float = float(np.sign(np.median(signed_area)))
+    if orientation == 0 or np.any(orientation * signed_area <= 0):
+        raise SystemError(
+            'During the Laplacian smoothing operation, one of the cells was inverted and a negative area was '
+            f'computed. Adjust the mesh parameters or number of smoothing operations to resolve this issue.'
+        )
+
+    # Set each node to its final smoothed position
     for i, tag in enumerate(node_tags):
-        coords: list[float] = [float(xy_coords_copy[i, 0]), float(xy_coords_copy[i, 1]), 0]
+        coords: list[float] = [float(xy[i, 0]), float(xy[i, 1]), 0]
         gmsh.model.mesh.set_node(tag, coords, [])
 
     return iteration
@@ -533,7 +550,7 @@ def _smooth_interfaces(params: MeshParameters) -> int:
 def mesh_domain(params: MeshParameters, filename: str | Path | None, display: bool = False):
     gmsh.initialize()
     gmsh.clear()
-    gmsh.model.add('structured_ogrid_mesh')
+    gmsh.model.add('2d_compressible_cylinder_crossflow')
 
     geometry: GeometryBuilder = GeometryBuilder()
     geometry.hide_constructions(0, origin := geometry.point(0, 0))
@@ -636,10 +653,29 @@ def mesh_domain(params: MeshParameters, filename: str | Path | None, display: bo
 
     gmsh.model.geo.synchronize()
 
+    # Create physical groups to be saved to the msh file.
+    surfaces: list[int] = ogrid_surfaces + transition_surfaces + quadrant_surfaces
+    inlet_curves: list[int] = [_get_vertical_edge(0, j) for j in range(3)]
+    outlet_curves: list[int] = [_get_vertical_edge(3, j) for j in range(3)]
+    bottom_curves: list[int] = [_get_horizontal_edge(i, 0) for i in range(3)]
+    top_curves: list[int] = [_get_horizontal_edge(i, 3) for i in range(3)]
+
+    gmsh.model.add_physical_group(1, cylinder_arcs, name='cylinder')
+    gmsh.model.add_physical_group(1, inlet_curves, name='inlet')
+    gmsh.model.add_physical_group(1, outlet_curves, name='outlet')
+    gmsh.model.add_physical_group(1, bottom_curves, name='bottom')
+    gmsh.model.add_physical_group(1, top_curves, name='top')
+    gmsh.model.add_physical_group(2, surfaces, name='fluid')
+
+    # Use the built-in elliptic smoothing operation provided by gmsh to improve cell transitions inside the
+    # transition square region
     for surface in transition_surfaces:
         gmsh.model.mesh.set_smoothing(2, surface, 20)
 
+    # Apply loaded transfinite curve and transfinite surface constraints
     geometry.apply_constraints()
+
+    # Edit gmsh options for displaying the mesh in the UI
     gmsh.option.set_number('Mesh.ColorCarousel', 2)
     gmsh.option.set_number('Mesh.Algorithm', 8)
     gmsh.option.set_number('General.BackgroundGradient', 0)
@@ -648,11 +684,16 @@ def mesh_domain(params: MeshParameters, filename: str | Path | None, display: bo
     gmsh.option.set_color('Mesh.Lines', 0, 0, 0)
     gmsh.model.mesh.generate(2)
 
+    # Update mesh visibilities in the GUI by hiding all construction geometries. Construction geometries include
+    # radial lines, O-grid arcs, transition square lines, interior quadrant lines
     geometry.apply_visibilities()
 
-    iterations: int = _smooth_interfaces(params)
+    # Run smoothing operations using Laplacian smoothing to alleviate the sharp corner transitions between the O-grid
+    # cells and transition square cells
+    iterations: int = _smooth_interface_nodes(params)
     print(f'Ran {iterations} smoothing iterations')
 
+    # Verify the file path is valid and save all physical groups to the mesh file
     if (path := _validate_filename(filename)):
         gmsh.write(str(path))
 
